@@ -44,6 +44,9 @@ jobs:
           docker build -t "${ECR_REPOSITORY}:${IMAGE_TAG}" .
           docker tag "${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_URI}:${IMAGE_TAG}"
           docker push "${ECR_URI}:${IMAGE_TAG}"
+          # Also update the 'latest' tag so the existing task definition can reference :latest
+          docker tag "${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_URI}:latest"
+          docker push "${ECR_URI}:latest"
 
       - name: Ensure CloudWatch log group exists
         env:
@@ -53,43 +56,9 @@ jobs:
           aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --query "logGroups[0].logGroupName" --output text >/dev/null 2>&1 || \
           aws logs create-log-group --log-group-name "$LOG_GROUP"
 
-      - name: Register new task definition
-        id: register_task
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ env.IMAGE_TAG }}
-          ACCOUNT_ID: ${{ env.ACCOUNT_ID }}
-        run: |
-          IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
-          # register task definition (Fargate)
-          REGISTER_OUTPUT=$(aws ecs register-task-definition \
-            --family "${{ secrets.TASK_FAMILY }}" \
-            --network-mode awsvpc \
-            --requires-compatibilities FARGATE \
-            --cpu "${{ secrets.TASK_CPU }}" \
-            --memory "${{ secrets.TASK_MEMORY }}" \
-            --execution-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole" \
-            --container-definitions "[
-              {
-                \"name\": \"${{ secrets.CONTAINER_NAME }}\",
-                \"image\": \"${IMAGE_URI}\",
-                \"essential\": true,
-                \"portMappings\": [{\"containerPort\": ${ { secrets.CONTAINER_PORT } }, \"protocol\": \"tcp\"}],
-                \"logConfiguration\": {
-                  \"logDriver\": \"awslogs\",
-                  \"options\": {
-                    \"awslogs-group\": \"/ecs/${{ secrets.TASK_FAMILY }}\",
-                    \"awslogs-region\": \"${AWS_REGION}\",
-                    \"awslogs-stream-prefix\": \"ecs\"
-                  }
-                }
-              }
-            ]" )
-          echo "$REGISTER_OUTPUT"
-          TASK_DEF_ARN=$(echo "$REGISTER_OUTPUT" | jq -r '.taskDefinition.taskDefinitionArn')
-          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
-          echo "::set-output name=task_def_arn::$TASK_DEF_ARN"
+      # Note: We do NOT register a new task definition here. The service task definition should
+      # reference the image tag `:latest`. We push both the SHA tag and `latest`, then force a
+      # new deployment so running tasks pull the new `latest` image.
 
       - name: Update ECS service (force new deployment)
         env:
@@ -98,5 +67,4 @@ jobs:
           aws ecs update-service \
             --cluster "${{ secrets.CLUSTER_NAME }}" \
             --service "${{ secrets.SERVICE_NAME }}" \
-            --task-definition "$TASK_DEF_ARN" \
             --force-new-deployment
