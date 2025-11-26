@@ -1,0 +1,104 @@
+name: Build and Deploy to AWS ECS (Fargate)
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Ensure ECR repository exists
+        run: |
+          aws ecr describe-repositories --repository-names "${{ secrets.ECR_REPOSITORY }}" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "${{ secrets.ECR_REPOSITORY }}"
+
+      - name: Get AWS account ID
+        id: get_account
+        run: |
+          echo "ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_ENV
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag and push Docker image to ECR
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        run: |
+          ECR_URI="${{ env.ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+          echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
+          docker build -t "${ECR_REPOSITORY}:${IMAGE_TAG}" .
+          docker tag "${ECR_REPOSITORY}:${IMAGE_TAG}" "${ECR_URI}:${IMAGE_TAG}"
+          docker push "${ECR_URI}:${IMAGE_TAG}"
+
+      - name: Ensure CloudWatch log group exists
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          LOG_GROUP="/ecs/${{ secrets.TASK_FAMILY }}"
+          aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --query "logGroups[0].logGroupName" --output text >/dev/null 2>&1 || \
+          aws logs create-log-group --log-group-name "$LOG_GROUP"
+
+      - name: Register new task definition
+        id: register_task
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          ACCOUNT_ID: ${{ env.ACCOUNT_ID }}
+        run: |
+          IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          # register task definition (Fargate)
+          REGISTER_OUTPUT=$(aws ecs register-task-definition \
+            --family "${{ secrets.TASK_FAMILY }}" \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --cpu "${{ secrets.TASK_CPU }}" \
+            --memory "${{ secrets.TASK_MEMORY }}" \
+            --execution-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole" \
+            --container-definitions "[
+              {
+                \"name\": \"${{ secrets.CONTAINER_NAME }}\",
+                \"image\": \"${IMAGE_URI}\",
+                \"essential\": true,
+                \"portMappings\": [{\"containerPort\": ${ { secrets.CONTAINER_PORT } }, \"protocol\": \"tcp\"}],
+                \"logConfiguration\": {
+                  \"logDriver\": \"awslogs\",
+                  \"options\": {
+                    \"awslogs-group\": \"/ecs/${{ secrets.TASK_FAMILY }}\",
+                    \"awslogs-region\": \"${AWS_REGION}\",
+                    \"awslogs-stream-prefix\": \"ecs\"
+                  }
+                }
+              }
+            ]" )
+          echo "$REGISTER_OUTPUT"
+          TASK_DEF_ARN=$(echo "$REGISTER_OUTPUT" | jq -r '.taskDefinition.taskDefinitionArn')
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+          echo "::set-output name=task_def_arn::$TASK_DEF_ARN"
+
+      - name: Update ECS service (force new deployment)
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          aws ecs update-service \
+            --cluster "${{ secrets.CLUSTER_NAME }}" \
+            --service "${{ secrets.SERVICE_NAME }}" \
+            --task-definition "$TASK_DEF_ARN" \
+            --force-new-deployment
